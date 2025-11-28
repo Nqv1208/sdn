@@ -12,7 +12,7 @@ class QoSController(app_manager.RyuApp):
         super(QoSController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
 
-        # Cấu hình QoS - ĐIỀU CHỈNH THEO TOPOLOGY CỦA BẠN
+        # Cấu hình QoS - ĐIỀU CHỈNH THEO TOPOLOGY
         self.qos_config = {
             # Luồng ưu tiên: h1 (10.0.0.1) -> h4 (10.0.0.4)
             "priority_flows": [
@@ -51,7 +51,6 @@ class QoSController(app_manager.RyuApp):
         self.add_flow(datapath, 0, match, actions)
 
     def _install_meters(self, datapath):
-        """Cài đặt OpenFlow meters cho QoS"""
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         

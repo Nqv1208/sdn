@@ -19,6 +19,8 @@ import time
 import math
 import numpy as np
 
+from app import state_store, command_store
+
 class FlowAnalysisDDoSDetector(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -85,6 +87,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor_loop)
         self.stats_request_thread = hub.spawn(self._stats_request_loop)
         self.analysis_thread = hub.spawn(self._analysis_loop)
+        self.command_thread = hub.spawn(self._command_loop)
         
         # Timing
         self.last_analysis = time.time()
@@ -290,9 +293,16 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         flows = []
         
         for stat in ev.msg.body:
+            match_fields = {}
+            try:
+                for key, value in stat.match.items():
+                    match_fields[str(key)] = value
+            except AttributeError:
+                match_fields = {'raw': str(stat.match)}
+
             flows.append({
                 'priority': stat.priority,
-                'match': stat.match,
+                'match': match_fields,
                 'duration_sec': stat.duration_sec,
                 'packet_count': stat.packet_count,
                 'byte_count': stat.byte_count,
@@ -327,6 +337,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         while True:
             hub.sleep(5)
             self._analyze_all_hosts()
+            self._export_state()
 
     def _analyze_all_hosts(self):
         """Analyze all hosts for anomalies"""
@@ -579,3 +590,137 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                   f'anomaly={anomaly:.2f}')
         
         print('='*80 + '\n')
+
+    # ==================== STATE EXPORT ====================
+
+    def _export_state(self):
+        """Persist current controller state for external API."""
+        stats = dict(self.attack_stats)
+        stats['blocked_ips'] = list(stats.get('blocked_ips', []))
+
+        snapshot = {
+            'uptime_seconds': time.time() - self.start_time,
+            'network': self._serialize_network(),
+            'flows': self._serialize_flow_stats(),
+            'ports': self._serialize_port_stats(),
+            'hosts': self._serialize_host_metrics(),
+            'threats': self._serialize_threats(),
+            'anomaly_scores': self._serialize_anomaly_scores(),
+            'thresholds': self.thresholds,
+            'stats': stats,
+        }
+        state_store.persist_controller_state(snapshot)
+
+    def _serialize_network(self):
+        switches = []
+        for dpid, datapath in self.datapaths.items():
+            switches.append({
+                'dpid': format(dpid, '016x'),
+                'numeric_dpid': dpid,
+                'flow_count': len(self.flow_stats.get(dpid, [])),
+                'port_count': len(self.port_stats.get(dpid, {})),
+            })
+
+        return {
+            'switch_count': len(switches),
+            'host_count': len(self.host_metrics),
+            'switches': switches,
+        }
+
+    def _serialize_flow_stats(self):
+        serialized = {}
+        for dpid, flows in self.flow_stats.items():
+            serialized[str(dpid)] = flows
+        return serialized
+
+    def _serialize_port_stats(self):
+        serialized = {}
+        for dpid, ports in self.port_stats.items():
+            serialized[str(dpid)] = ports
+        return serialized
+
+    def _serialize_host_metrics(self):
+        serialized = {}
+        for host_ip, metrics in self.host_metrics.items():
+            serialized[host_ip] = {
+                'packet_rate': metrics.get('packet_rate', 0),
+                'byte_rate': metrics.get('byte_rate', 0),
+                'flow_rate': metrics.get('flow_rate', 0),
+                'protocol_dist': dict(metrics.get('protocol_dist', {})),
+                'port_dist_top': self._top_n(metrics.get('port_dist', {})),
+                'tcp_flags': dict(metrics.get('tcp_flags', {})),
+                'packet_samples': list(metrics.get('packet_size', []))[-10:],
+                'inter_arrival_samples': list(metrics.get('inter_arrival', []))[-10:],
+                'last_seen': metrics.get('last_seen', 0),
+            }
+        return serialized
+
+    def _serialize_threats(self):
+        return {
+            'blacklist': list(self.blacklist),
+            'greylist': [
+                {'ip': ip, 'count': data['count'], 'score': data['score']}
+                for ip, data in self.greylist.items()
+            ],
+            'whitelist': list(self.whitelist),
+            'blocked_ips': list(self.attack_stats.get('blocked_ips', [])),
+        }
+
+    def _serialize_anomaly_scores(self):
+        return {ip: score for ip, score in self.anomaly_scores.items()}
+
+    def _top_n(self, data_dict, n=5):
+        items = sorted(data_dict.items(), key=lambda kv: kv[1], reverse=True)
+        return [{'port_or_key': key, 'count': value} for key, value in items[:n]]
+
+    # ==================== COMMAND PROCESSOR ====================
+
+    def _command_loop(self):
+        """Poll queued commands from Flask API."""
+        while True:
+            hub.sleep(2)
+            commands = command_store.pop_all_commands()
+            for command in commands:
+                self._process_command(command)
+
+    def _process_command(self, command):
+        cmd_type = command.get('type')
+        payload = command.get('payload', {})
+        ip_address = payload.get('ip')
+
+        if cmd_type == 'block_ip' and ip_address:
+            self._block_ip_all_switches(ip_address)
+        elif cmd_type == 'unblock_ip' and ip_address:
+            self._unblock_ip_all_switches(ip_address)
+        elif cmd_type == 'whitelist_ip' and ip_address:
+            self.whitelist.add(ip_address)
+            self.logger.info('Added %s to whitelist via API', ip_address)
+        elif cmd_type == 'remove_whitelist_ip' and ip_address:
+            self.whitelist.discard(ip_address)
+            self.logger.info('Removed %s from whitelist via API', ip_address)
+        elif cmd_type == 'set_thresholds':
+            for key, value in payload.items():
+                if key in self.thresholds:
+                    self.thresholds[key] = value
+            self.logger.info('Thresholds updated via API: %s', payload)
+        else:
+            self.logger.warning('Unknown command from API: %s', command)
+
+    def _unblock_ip_all_switches(self, src_ip):
+        """Remove blocking flows for IP."""
+        for datapath in self.datapaths.values():
+            parser = datapath.ofproto_parser
+            ofproto = datapath.ofproto
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY,
+                out_group=ofproto.OFPG_ANY,
+                match=match,
+            )
+            datapath.send_msg(mod)
+
+        self.blacklist.discard(src_ip)
+        self.attack_stats['blocked_ips'].discard(src_ip)
+        self.logger.info('🟢 Unblocked %s on all switches', src_ip)

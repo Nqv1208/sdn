@@ -175,7 +175,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
             if self._quick_anomaly_check(src_ip):
                 self.logger.warning('⚠️  Quick anomaly detected from %s', src_ip)
 
-        # === NORMAL SWITCHING ===
+        # === NORMAL SWITCHING (L2 learning, handle ARP/IP) ===
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
@@ -183,16 +183,24 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install flow
-        if out_port != ofproto.OFPP_FLOOD and ip_pkt:
-            match = parser.OFPMatch(in_port=in_port, 
-                                   eth_type=0x0800,
-                                   ipv4_src=ip_pkt.src,
-                                   ipv4_dst=ip_pkt.dst)
-            
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 10, match, actions, 
-                            msg.buffer_id, idle=10)
+        # Install flow for known destination (covers ARP + IP)
+        if out_port != ofproto.OFPP_FLOOD:
+            l2_match = parser.OFPMatch(in_port=in_port,
+                                       eth_src=src,
+                                       eth_dst=dst)
+            # Prefer specific IP match when available
+            if ip_pkt:
+                l3_match = parser.OFPMatch(in_port=in_port,
+                                           eth_type=0x0800,
+                                           ipv4_src=ip_pkt.src,
+                                           ipv4_dst=ip_pkt.dst)
+                match = l3_match
+            else:
+                match = l2_match
+
+            if msg.buffer_id != ofproto.OFPP_NO_BUFFER:
+                self.add_flow(datapath, 10, match, actions,
+                              msg.buffer_id, idle=10)
                 return
             else:
                 self.add_flow(datapath, 10, match, actions, idle=10)
@@ -202,11 +210,11 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
 
-        out = parser.OFPPacketOut(datapath=datapath, 
-                                 buffer_id=msg.buffer_id,
-                                 in_port=in_port, 
-                                 actions=actions, 
-                                 data=data)
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=msg.buffer_id,
+                                  in_port=in_port,
+                                  actions=actions,
+                                  data=data)
         datapath.send_msg(out)
 
     # ==================== FEATURE EXTRACTION ====================

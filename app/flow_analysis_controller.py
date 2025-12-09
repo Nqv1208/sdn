@@ -175,7 +175,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
             if self._quick_anomaly_check(src_ip):
                 self.logger.warning('⚠️  Quick anomaly detected from %s', src_ip)
 
-        # === NORMAL SWITCHING (L2 learning, handle ARP/IP) ===
+        # === NORMAL SWITCHING ===
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
@@ -183,38 +183,43 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install flow for known destination (covers ARP + IP)
+        # Install flows for known destination
         if out_port != ofproto.OFPP_FLOOD:
-            l2_match = parser.OFPMatch(in_port=in_port,
-                                       eth_src=src,
-                                       eth_dst=dst)
-            # Prefer specific IP match when available
+            # ====== FLOW 1: L2 (Priority 10) ======
+            # Match chỉ dựa vào in_port và destination MAC
+            # Xử lý TẤT CẢ packets đến dst này (bao gồm ARP)
+            match_l2 = parser.OFPMatch(
+                in_port=in_port,
+                eth_dst=dst
+            )
+            self.add_flow(datapath, 10, match_l2, actions, idle=30, hard=0)
+            self.logger.debug('Installed L2 flow: in_port=%s eth_dst=%s -> out_port=%s',
+                            in_port, dst, out_port)
+            
+            # ====== FLOW 2: L3 (Priority 20) - Chỉ khi là IP ======
+            # Match cụ thể IP src->dst, ưu tiên cao hơn L2
             if ip_pkt:
-                l3_match = parser.OFPMatch(in_port=in_port,
-                                           eth_type=0x0800,
-                                           ipv4_src=ip_pkt.src,
-                                           ipv4_dst=ip_pkt.dst)
-                match = l3_match
-            else:
-                match = l2_match
-
-            if msg.buffer_id != ofproto.OFPP_NO_BUFFER:
-                self.add_flow(datapath, 10, match, actions,
-                              msg.buffer_id, idle=10)
-                return
-            else:
-                self.add_flow(datapath, 10, match, actions, idle=10)
+                match_l3 = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_type=0x0800,
+                    ipv4_dst=ip_pkt.dst  # CHỈ match destination IP
+                )
+                self.add_flow(datapath, 20, match_l3, actions, idle=30, hard=0)
+                self.logger.debug('Installed L3 flow: in_port=%s ip_dst=%s -> out_port=%s',
+                                in_port, ip_pkt.dst, out_port)
 
         # Send packet out
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
 
-        out = parser.OFPPacketOut(datapath=datapath,
-                                  buffer_id=msg.buffer_id,
-                                  in_port=in_port,
-                                  actions=actions,
-                                  data=data)
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data
+        )
         datapath.send_msg(out)
 
     # ==================== FEATURE EXTRACTION ====================

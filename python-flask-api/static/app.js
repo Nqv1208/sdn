@@ -79,17 +79,31 @@ function renderHosts(hosts = {}, anomalies = {}) {
     anomaly: anomalies[ip] || 0,
   }));
 
+  // Sort: blacklisted IPs first, then by packet_rate
+  rows.sort((a, b) => {
+    const aBlocked = a.is_blacklisted || false;
+    const bBlocked = b.is_blacklisted || false;
+    if (aBlocked && !bBlocked) return -1;
+    if (!aBlocked && bBlocked) return 1;
+    return (b.packet_rate || 0) - (a.packet_rate || 0);
+  });
+
   hostTableBody.innerHTML = rows
     .map(
-      (host) => `
-      <tr>
-        <td>${host.ip}</td>
+      (host) => {
+        const isBlocked = host.is_blacklisted || false;
+        const rowClass = isBlocked ? 'blocked-host' : '';
+        const blockedBadge = isBlocked ? ' <span class="badge blocked">BLOCKED</span>' : '';
+        return `
+      <tr class="${rowClass}">
+        <td>${host.ip}${blockedBadge}</td>
         <td>${host.packet_rate?.toFixed(2) || 0}</td>
         <td>${host.byte_rate?.toFixed(2) || 0}</td>
         <td>${host.anomaly?.toFixed(2)}</td>
         <td>${formatDate(host.last_seen)}</td>
       </tr>
-    `
+    `;
+      }
     )
     .join("");
 }
@@ -105,30 +119,63 @@ function renderQoS(qos = {}) {
   }));
 
   if (rows.length === 0) {
-    qosTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center;">Chưa có cấu hình QoS</td></tr>';
+    qosTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 2rem;">Chưa có cấu hình QoS</td></tr>';
     return;
   }
 
-  qosTableBody.innerHTML = rows
-    .map(
-      (q) => `
-      <tr>
-        <td>${q.ip}</td>
-        <td>${q.rate_kbps}</td>
-        <td>${q.burst_kb || "N/A"}</td>
-        <td>${q.meter_id}</td>
-        <td>
-          <button class="remove-qos-btn" data-ip="${q.ip}">Remove</button>
-        </td>
-      </tr>
-    `
-    )
-    .join("");
+  // Check if mobile view (screen width < 768px)
+  // Use matchMedia for better detection
+  const isMobile = window.matchMedia("(max-width: 767px)").matches;
+  
+  if (isMobile) {
+    // Mobile-friendly card layout
+    qosTableBody.innerHTML = rows
+      .map(
+        (q) => `
+        <tr class="qos-mobile-row">
+          <td colspan="5">
+            <div class="qos-mobile-card">
+              <div class="qos-mobile-header">
+                <strong>${q.ip}</strong>
+                <button class="remove-qos-btn" data-ip="${q.ip}">Remove</button>
+              </div>
+              <div class="qos-mobile-details">
+                <div><span class="qos-label">Rate:</span> ${q.rate_kbps} kbps</div>
+                <div><span class="qos-label">Burst:</span> ${q.burst_kb || "N/A"} KB</div>
+                <div><span class="qos-label">Meter ID:</span> ${q.meter_id}</div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `
+      )
+      .join("");
+  } else {
+    // Desktop table layout
+    qosTableBody.innerHTML = rows
+      .map(
+        (q) => `
+        <tr>
+          <td>${q.ip}</td>
+          <td>${q.rate_kbps}</td>
+          <td>${q.burst_kb || "N/A"}</td>
+          <td>${q.meter_id}</td>
+          <td>
+            <button class="remove-qos-btn" data-ip="${q.ip}">Remove</button>
+          </td>
+        </tr>
+      `
+      )
+      .join("");
+  }
 
   // Attach event listeners to remove buttons
   document.querySelectorAll(".remove-qos-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       const ip = e.target.getAttribute("data-ip");
+      if (!confirm(`Bạn có chắc muốn xóa QoS cho ${ip}?`)) {
+        return;
+      }
       try {
         await fetch("/api/commands/qos/remove", {
           method: "POST",
@@ -143,6 +190,16 @@ function renderQoS(qos = {}) {
     });
   });
 }
+
+// Re-render QoS table on window resize
+let resizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    // Re-fetch and render QoS to update layout
+    fetchJSON("/api/qos").then((qos) => renderQoS(qos));
+  }, 250);
+});
 
 async function submitCommand(endpoint, formEl) {
   const formData = new FormData(formEl);

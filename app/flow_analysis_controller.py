@@ -241,13 +241,20 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
             
-            # Check blacklist
-            if src_ip in self.blacklist:
+            # Check blacklist - but still track metrics for visibility
+            is_blacklisted = src_ip in self.blacklist
+            if is_blacklisted:
                 self.attack_stats['total_packets_blocked'] += 1
-                return  # Drop silently
+                # Still track metrics for blacklisted IPs so they appear in dashboard
+                # but we'll drop the packet later
             
             # Extract features for source IP (outgoing traffic)
+            # This ensures blacklisted IPs still appear in Top Traffic Sources
             self._extract_packet_features(pkt, src_ip, dst_ip, len(msg.data))
+            
+            # Drop blacklisted packets after tracking
+            if is_blacklisted:
+                return  # Drop silently after tracking
             
             # Also track destination IP to ensure all hosts are discovered
             # This helps when a host only receives packets (e.g., ping replies)
@@ -716,17 +723,34 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                 print(f'    {ip}: warnings={info["count"]}, score={info["score"]:.2f}')
         
         print(f'\n📈 TOP TRAFFIC SOURCES:')
-        sorted_hosts = sorted(
-            self.host_metrics.items(),
-            key=lambda x: x[1]['packet_rate'],
-            reverse=True
-        )[:5]
+        # Include blacklisted IPs even if they have low packet_rate
+        # This ensures blocked IPs are visible in the dashboard
+        all_hosts = list(self.host_metrics.items())
+        blacklisted_hosts = [(ip, self.host_metrics[ip]) for ip in self.blacklist if ip in self.host_metrics]
+        other_hosts = [(ip, metrics) for ip, metrics in all_hosts if ip not in self.blacklist]
         
-        for src_ip, metrics in sorted_hosts:
+        # Sort by packet_rate
+        sorted_blacklisted = sorted(blacklisted_hosts, key=lambda x: x[1]['packet_rate'], reverse=True)
+        sorted_other = sorted(other_hosts, key=lambda x: x[1]['packet_rate'], reverse=True)
+        
+        # Combine: show blacklisted first (up to 3), then top others
+        display_hosts = sorted_blacklisted[:3] + sorted_other[:5]
+        # Remove duplicates and limit to 5
+        seen = set()
+        final_hosts = []
+        for ip, metrics in display_hosts:
+            if ip not in seen:
+                seen.add(ip)
+                final_hosts.append((ip, metrics))
+                if len(final_hosts) >= 5:
+                    break
+        
+        for src_ip, metrics in final_hosts:
             status = '🔴' if src_ip in self.blacklist else '🟢'
             anomaly = self.anomaly_scores.get(src_ip, 0)
+            blocked_note = ' [BLOCKED]' if src_ip in self.blacklist else ''
             print(f'  {status} {src_ip}: {metrics["packet_rate"]:.1f} pps, '
-                  f'anomaly={anomaly:.2f}')
+                  f'anomaly={anomaly:.2f}{blocked_note}')
         
         print('='*80 + '\n')
 
@@ -787,9 +811,12 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
             # This ensures hosts like h6 are visible in the dashboard
             last_seen = metrics.get('last_seen', 0)
             packet_rate = metrics.get('packet_rate', 0)
+            is_blacklisted = host_ip in self.blacklist
             
-            # Include host if it has been seen recently (within last 60 seconds) or has traffic
-            if last_seen > 0 and (current_time - last_seen < 60 or packet_rate > 0):
+            # Include host if:
+            # 1. It has been seen recently (within last 60 seconds) or has traffic, OR
+            # 2. It's blacklisted (always show blacklisted IPs for visibility)
+            if last_seen > 0 and (current_time - last_seen < 60 or packet_rate > 0 or is_blacklisted):
                 serialized[host_ip] = {
                     'packet_rate': packet_rate,
                     'byte_rate': metrics.get('byte_rate', 0),
@@ -800,6 +827,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                     'packet_samples': list(metrics.get('packet_size', []))[-10:],
                     'inter_arrival_samples': list(metrics.get('inter_arrival', []))[-10:],
                     'last_seen': last_seen,
+                    'is_blacklisted': is_blacklisted,  # Add flag for frontend
                 }
         return serialized
 

@@ -66,6 +66,32 @@
         <h2>Blacklist</h2>
         <ul id="blacklist"></ul>
       </section>
+
+      <section>
+        <h2>QoS Configuration</h2>
+        <form id="qos-form">
+          <label>IP Address</label>
+          <input type="text" name="ip" placeholder="10.0.0.4" required />
+          <label>Rate Limit (kbps)</label>
+          <input type="number" name="rate_kbps" placeholder="1000" min="1" required />
+          <label>Burst (KB, optional)</label>
+          <input type="number" name="burst_kb" placeholder="100" min="1" />
+          <button type="submit">Set QoS</button>
+        </form>
+
+        <table id="qos-table" style="margin-top: 20px;">
+          <thead>
+            <tr>
+              <th>IP Address</th>
+              <th>Rate (kbps)</th>
+              <th>Burst (KB)</th>
+              <th>Meter ID</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="qos-table-body"></tbody>
+        </table>
+      </section>
     </main>
 
     <footer>

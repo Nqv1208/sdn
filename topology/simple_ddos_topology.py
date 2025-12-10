@@ -58,6 +58,13 @@ def create_topology():
     s2.start([c0])
     s3.start([c0])
     
+    info('*** Configuring network interfaces\n')
+    # Ensure all hosts have proper network configuration
+    for host in [h1, h2, h3, h4, h5, h6]:
+        host.cmd('ip link set %s-eth0 up' % host.name)
+        # Add default route if needed
+        host.cmd('ip route add default via 10.0.0.1 2>/dev/null || true')
+    
     info('*** Setting up services\n')
     # h3 as web server
     h3.cmd('python3 -m http.server 80 &')

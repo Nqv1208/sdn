@@ -69,6 +69,12 @@ def api_anomalies():
     return jsonify(state.get("anomaly_scores", {}))
 
 
+@app.route("/api/qos")
+def api_qos():
+    state = _latest_state()
+    return jsonify(state.get("qos_config", {}))
+
+
 @app.route("/api/commands/block", methods=["POST"])
 def api_block():
     payload = request.get_json(force=True)
@@ -118,6 +124,42 @@ def api_thresholds():
     payload = request.get_json(force=True) or {}
     command_store.enqueue_command("set_thresholds", payload)
     return jsonify({"status": "queued", "updated": list(payload.keys())})
+
+
+@app.route("/api/commands/qos/set", methods=["POST"])
+def api_qos_set():
+    payload = request.get_json(force=True) or {}
+    ip_address = payload.get("ip")
+    rate_kbps = payload.get("rate_kbps")
+    
+    if not ip_address or not rate_kbps:
+        return jsonify({"error": "Missing ip or rate_kbps"}), 400
+    
+    if not isinstance(rate_kbps, (int, float)) or rate_kbps <= 0:
+        return jsonify({"error": "rate_kbps must be a positive number"}), 400
+    
+    command_payload = {
+        "ip": ip_address,
+        "rate_kbps": int(rate_kbps),
+    }
+    
+    if "burst_kb" in payload:
+        command_payload["burst_kb"] = int(payload["burst_kb"])
+    
+    command_store.enqueue_command("set_qos", command_payload)
+    return jsonify({"status": "queued", "ip": ip_address, "rate_kbps": rate_kbps})
+
+
+@app.route("/api/commands/qos/remove", methods=["POST"])
+def api_qos_remove():
+    payload = request.get_json(force=True) or {}
+    ip_address = payload.get("ip")
+    
+    if not ip_address:
+        return jsonify({"error": "Missing ip"}), 400
+    
+    command_store.enqueue_command("remove_qos", {"ip": ip_address})
+    return jsonify({"status": "queued", "ip": ip_address})
 
 
 def create_app():

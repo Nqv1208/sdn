@@ -11,7 +11,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp, icmp
+from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp, icmp, arp
 from ryu.lib import hub
 from collections import defaultdict, deque
 from datetime import datetime
@@ -66,6 +66,10 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.greylist = {}  # IP -> warning_count
         self.whitelist = set()  # Trusted IPs
         
+        # === QoS CONFIGURATION ===
+        self.qos_config = {}  # IP -> {'rate_kbps': int, 'burst_kb': int, 'meter_id': int}
+        self.next_meter_id = 1  # Auto-increment meter IDs
+        
         # === ANOMALY SCORES ===
         self.anomaly_scores = defaultdict(float)
         
@@ -88,6 +92,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.stats_request_thread = hub.spawn(self._stats_request_loop)
         self.analysis_thread = hub.spawn(self._analysis_loop)
         self.command_thread = hub.spawn(self._command_loop)
+        self.table_miss_maintenance_thread = hub.spawn(self._table_miss_maintenance_loop)
         
         # Timing
         self.last_analysis = time.time()
@@ -106,19 +111,41 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.datapaths[dpid] = datapath
         self.logger.info('🟢 Switch %016x connected', dpid)
 
-        # Install table-miss
+        # Install table-miss flow (always ensure this exists)
+        self._install_table_miss_flow(datapath)
+
+    def _install_table_miss_flow(self, datapath):
+        """Install or reinstall table-miss flow to ensure packets always come to controller"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=0,  # Lowest priority (table-miss)
+            match=match,
+            instructions=inst,
+            command=ofproto.OFPFC_ADD,  # Add or modify
+            flags=ofproto.OFPFF_CHECK_OVERLAP
+        )
+        datapath.send_msg(mod)
+        self.logger.debug('✅ Table-miss flow installed/reinstalled on switch %016x', datapath.id)
 
     def add_flow(self, datapath, priority, match, actions, 
-                 buffer_id=None, idle=0, hard=0):
-        """Add flow entry to switch"""
+                 buffer_id=None, idle=0, hard=0, meter_id=None):
+        """Add flow entry to switch with optional meter"""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        
+        # Add meter instruction if meter_id provided
+        if meter_id is not None:
+            inst.insert(0, parser.OFPInstructionMeter(meter_id))
         
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
@@ -156,6 +183,57 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src] = in_port
 
+        # === ARP HANDLING ===
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt:
+            # Handle ARP request/reply
+            if arp_pkt.opcode == arp.ARP_REQUEST:
+                # Learn MAC from ARP request
+                self.mac_to_port[dpid][arp_pkt.src_mac] = in_port
+                # Forward ARP request
+                if dst in self.mac_to_port[dpid]:
+                    out_port = self.mac_to_port[dpid][dst]
+                else:
+                    out_port = ofproto.OFPP_FLOOD
+                
+                actions = [parser.OFPActionOutput(out_port)]
+                data = None
+                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                    data = msg.data
+                
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=msg.buffer_id,
+                    in_port=in_port,
+                    actions=actions,
+                    data=data
+                )
+                datapath.send_msg(out)
+                return
+            elif arp_pkt.opcode == arp.ARP_REPLY:
+                # Learn MAC from ARP reply
+                self.mac_to_port[dpid][arp_pkt.src_mac] = in_port
+                # Forward ARP reply
+                if dst in self.mac_to_port[dpid]:
+                    out_port = self.mac_to_port[dpid][dst]
+                else:
+                    out_port = ofproto.OFPP_FLOOD
+                
+                actions = [parser.OFPActionOutput(out_port)]
+                data = None
+                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                    data = msg.data
+                
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=msg.buffer_id,
+                    in_port=in_port,
+                    actions=actions,
+                    data=data
+                )
+                datapath.send_msg(out)
+                return
+
         # === DEEP PACKET INSPECTION ===
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         
@@ -168,8 +246,27 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                 self.attack_stats['total_packets_blocked'] += 1
                 return  # Drop silently
             
-            # Extract features
+            # Extract features for source IP (outgoing traffic)
             self._extract_packet_features(pkt, src_ip, dst_ip, len(msg.data))
+            
+            # Also track destination IP to ensure all hosts are discovered
+            # This helps when a host only receives packets (e.g., ping replies)
+            # Track basic metrics for destination IP (incoming traffic)
+            if dst_ip and dst_ip != src_ip:  # Don't track loopback
+                dst_metrics = self.host_metrics[dst_ip]
+                current_time = time.time()
+                dst_metrics['last_seen'] = current_time
+                # Track that this host received a packet (for visibility)
+                # Add a minimal packet entry to show activity
+                if len(dst_metrics['packet_size']) == 0:
+                    # Initialize with actual packet size to show host exists
+                    dst_metrics['packet_size'].append(len(msg.data))
+                    dst_metrics['byte_rate'] = 0
+                    dst_metrics['packet_rate'] = 0
+                else:
+                    # Update last_seen even if we don't add to packet_size
+                    # This ensures host stays visible
+                    pass
             
             # Check for anomalies (quick check)
             if self._quick_anomaly_check(src_ip):
@@ -204,9 +301,13 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                     eth_type=0x0800,
                     ipv4_dst=ip_pkt.dst  # CHỈ match destination IP
                 )
-                self.add_flow(datapath, 20, match_l3, actions, idle=30, hard=0)
-                self.logger.debug('Installed L3 flow: in_port=%s ip_dst=%s -> out_port=%s',
-                                in_port, ip_pkt.dst, out_port)
+                # Check if QoS is configured for this IP
+                meter_id = None
+                if src_ip in self.qos_config:
+                    meter_id = self.qos_config[src_ip].get('meter_id')
+                self.add_flow(datapath, 20, match_l3, actions, idle=30, hard=0, meter_id=meter_id)
+                self.logger.debug('Installed L3 flow: in_port=%s ip_dst=%s -> out_port=%s (meter_id=%s)',
+                                in_port, ip_pkt.dst, out_port, meter_id)
 
         # Send packet out
         data = None
@@ -305,6 +406,9 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         dpid = ev.msg.datapath.id
         flows = []
         
+        # Check if table-miss flow exists
+        table_miss_exists = False
+        
         for stat in ev.msg.body:
             match_fields = {}
             try:
@@ -320,6 +424,21 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                 'packet_count': stat.packet_count,
                 'byte_count': stat.byte_count,
             })
+            
+            # Check if this is table-miss flow (priority 0, empty match)
+            if stat.priority == 0 and (not match_fields or len(match_fields) == 0):
+                table_miss_exists = True
+        
+        # Detect if table-miss flow was deleted (security concern)
+        if dpid in self.datapaths and not table_miss_exists and len(flows) > 0:
+            # There are flows but no table-miss - suspicious!
+            self.logger.warning('⚠️  SECURITY ALERT: Table-miss flow missing on switch %016x! '
+                              'Possible flow deletion attack. Reinstalling...', dpid)
+            self._install_table_miss_flow(ev.msg.datapath)
+        elif dpid in self.datapaths and len(flows) == 0:
+            # No flows at all - might be normal startup or all flows deleted
+            self.logger.warning('⚠️  No flows found on switch %016x. Reinstalling table-miss...', dpid)
+            self._install_table_miss_flow(ev.msg.datapath)
         
         self.flow_stats[dpid] = flows
 
@@ -363,11 +482,18 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         for src_ip, metrics in list(self.host_metrics.items()):
             # Calculate rates
             packet_count = len(metrics['packet_size'])
-            metrics['packet_rate'] = packet_count / time_window
+            metrics['packet_rate'] = packet_count / time_window if time_window > 0 else 0
             
             if metrics['packet_size']:
                 total_bytes = sum(metrics['packet_size'])
-                metrics['byte_rate'] = total_bytes / time_window
+                metrics['byte_rate'] = total_bytes / time_window if time_window > 0 else 0
+            else:
+                metrics['byte_rate'] = 0
+            
+            # Ensure packet_rate is set even if no packets (for visibility)
+            if metrics['packet_rate'] == 0 and metrics.get('last_seen', 0) > 0:
+                # Host exists but no recent packets - keep it visible with minimal rate
+                metrics['packet_rate'] = 0.01  # Small non-zero value for visibility
             
             # Analyze for DDoS
             anomaly_score = self._calculate_anomaly_score(src_ip, metrics)
@@ -619,6 +745,7 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
             'hosts': self._serialize_host_metrics(),
             'threats': self._serialize_threats(),
             'anomaly_scores': self._serialize_anomaly_scores(),
+            'qos_config': self._serialize_qos_config(),
             'thresholds': self.thresholds,
             'stats': stats,
         }
@@ -654,18 +781,26 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
 
     def _serialize_host_metrics(self):
         serialized = {}
+        current_time = time.time()
         for host_ip, metrics in self.host_metrics.items():
-            serialized[host_ip] = {
-                'packet_rate': metrics.get('packet_rate', 0),
-                'byte_rate': metrics.get('byte_rate', 0),
-                'flow_rate': metrics.get('flow_rate', 0),
-                'protocol_dist': dict(metrics.get('protocol_dist', {})),
-                'port_dist_top': self._top_n(metrics.get('port_dist', {})),
-                'tcp_flags': dict(metrics.get('tcp_flags', {})),
-                'packet_samples': list(metrics.get('packet_size', []))[-10:],
-                'inter_arrival_samples': list(metrics.get('inter_arrival', []))[-10:],
-                'last_seen': metrics.get('last_seen', 0),
-            }
+            # Include all hosts, even if they have no recent traffic
+            # This ensures hosts like h6 are visible in the dashboard
+            last_seen = metrics.get('last_seen', 0)
+            packet_rate = metrics.get('packet_rate', 0)
+            
+            # Include host if it has been seen recently (within last 60 seconds) or has traffic
+            if last_seen > 0 and (current_time - last_seen < 60 or packet_rate > 0):
+                serialized[host_ip] = {
+                    'packet_rate': packet_rate,
+                    'byte_rate': metrics.get('byte_rate', 0),
+                    'flow_rate': metrics.get('flow_rate', 0),
+                    'protocol_dist': dict(metrics.get('protocol_dist', {})),
+                    'port_dist_top': self._top_n(metrics.get('port_dist', {})),
+                    'tcp_flags': dict(metrics.get('tcp_flags', {})),
+                    'packet_samples': list(metrics.get('packet_size', []))[-10:],
+                    'inter_arrival_samples': list(metrics.get('inter_arrival', []))[-10:],
+                    'last_seen': last_seen,
+                }
         return serialized
 
     def _serialize_threats(self):
@@ -681,6 +816,17 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
 
     def _serialize_anomaly_scores(self):
         return {ip: score for ip, score in self.anomaly_scores.items()}
+
+    def _serialize_qos_config(self):
+        """Serialize QoS configuration for API"""
+        return {
+            ip: {
+                'rate_kbps': config['rate_kbps'],
+                'burst_kb': config['burst_kb'],
+                'meter_id': config['meter_id']
+            }
+            for ip, config in self.qos_config.items()
+        }
 
     def _top_n(self, data_dict, n=5):
         items = sorted(data_dict.items(), key=lambda kv: kv[1], reverse=True)
@@ -716,6 +862,12 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
                 if key in self.thresholds:
                     self.thresholds[key] = value
             self.logger.info('Thresholds updated via API: %s', payload)
+        elif cmd_type == 'set_qos' and ip_address:
+            rate_kbps = payload.get('rate_kbps', 1000)
+            burst_kb = payload.get('burst_kb')
+            self._set_qos_for_ip(ip_address, rate_kbps, burst_kb)
+        elif cmd_type == 'remove_qos' and ip_address:
+            self._remove_qos_for_ip(ip_address)
         else:
             self.logger.warning('Unknown command from API: %s', command)
 
@@ -737,3 +889,115 @@ class FlowAnalysisDDoSDetector(app_manager.RyuApp):
         self.blacklist.discard(src_ip)
         self.attack_stats['blocked_ips'].discard(src_ip)
         self.logger.info('🟢 Unblocked %s on all switches', src_ip)
+
+    # ==================== TABLE-MISS MAINTENANCE ====================
+
+    def _table_miss_maintenance_loop(self):
+        """Periodically ensure table-miss flow exists on all switches"""
+        while True:
+            hub.sleep(10)  # Check every 10 seconds
+            for dpid, datapath in list(self.datapaths.items()):
+                try:
+                    # Reinstall table-miss flow to ensure it exists
+                    # This handles cases where flows are deleted manually
+                    self._install_table_miss_flow(datapath)
+                except Exception as e:
+                    self.logger.warning('Failed to reinstall table-miss on switch %016x: %s', 
+                                      dpid, e)
+
+    # ==================== QoS MANAGEMENT ====================
+
+    def _install_meter(self, datapath, meter_id, rate_kbps, burst_kb):
+        """Install meter on switch for rate limiting"""
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        
+        bands = [parser.OFPMeterBandDrop(
+            rate=rate_kbps,      # Rate in kbps
+            burst_size=burst_kb  # Burst in KB
+        )]
+        
+        req = parser.OFPMeterMod(
+            datapath=datapath,
+            command=ofproto.OFPMC_ADD,
+            flags=ofproto.OFPMF_KBPS,
+            meter_id=meter_id,
+            bands=bands
+        )
+        
+        datapath.send_msg(req)
+        self.logger.info('📊 Installed meter %d: rate=%d kbps, burst=%d KB', 
+                        meter_id, rate_kbps, burst_kb)
+
+    def _remove_meter(self, datapath, meter_id):
+        """Remove meter from switch"""
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        
+        req = parser.OFPMeterMod(
+            datapath=datapath,
+            command=ofproto.OFPMC_DELETE,
+            flags=0,
+            meter_id=meter_id,
+            bands=[]
+        )
+        
+        datapath.send_msg(req)
+        self.logger.info('🗑️  Removed meter %d', meter_id)
+
+    def _apply_qos_to_existing_flows(self, ip_address, meter_id):
+        """Update existing flows for IP to use meter"""
+        for dpid, datapath in self.datapaths.items():
+            parser = datapath.ofproto_parser
+            
+            # Match flows by source IP
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_address)
+            
+            # Get out_port from mac_to_port if available
+            # For simplicity, we'll reinstall flows when next packet arrives
+            # This is handled in packet_in_handler
+            
+        self.logger.info('🔄 QoS will be applied to new flows for %s', ip_address)
+
+    def _set_qos_for_ip(self, ip_address, rate_kbps, burst_kb=None):
+        """Set QoS rate limit for an IP address"""
+        if burst_kb is None:
+            burst_kb = max(rate_kbps // 10, 1)  # Default burst = 10% of rate
+        
+        # Assign meter ID
+        meter_id = self.next_meter_id
+        self.next_meter_id += 1
+        
+        # Store QoS config
+        self.qos_config[ip_address] = {
+            'rate_kbps': rate_kbps,
+            'burst_kb': burst_kb,
+            'meter_id': meter_id
+        }
+        
+        # Install meter on all switches
+        for datapath in self.datapaths.values():
+            self._install_meter(datapath, meter_id, rate_kbps, burst_kb)
+        
+        # Update existing flows
+        self._apply_qos_to_existing_flows(ip_address, meter_id)
+        
+        self.logger.info('✅ QoS set for %s: rate=%d kbps, burst=%d KB, meter_id=%d',
+                        ip_address, rate_kbps, burst_kb, meter_id)
+
+    def _remove_qos_for_ip(self, ip_address):
+        """Remove QoS rate limit for an IP address"""
+        if ip_address not in self.qos_config:
+            return
+        
+        config = self.qos_config[ip_address]
+        meter_id = config['meter_id']
+        
+        # Remove meter from all switches
+        for datapath in self.datapaths.values():
+            self._remove_meter(datapath, meter_id)
+        
+        # Remove from config
+        del self.qos_config[ip_address]
+        
+        self.logger.info('❌ QoS removed for %s (meter_id=%d)', ip_address, meter_id)
